@@ -1,0 +1,109 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on the Go
+# project's own TryBot/LUCI infrastructure), so this workflow is written from
+# scratch. It packages the module zip exactly as the module proxy does and runs
+# the project's own test suite (`go test ./...`) on Linux, macOS and Windows
+# with Go 1.24 (the go.mod minimum) and Go 1.25.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test selector (packages and/or -run pattern); empty runs the full suite'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      # Build the packaging helper in its own module OUTSIDE the checkout, so
+      # `go get` never touches this repository's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      # golang.org/x/mod/zip skips .git but DESCENDS into .github, so this
+      # workflow would otherwise leak into the zip as extra entries that the
+      # public proxy artifact does not have. .gitignore and .gitattributes are
+      # kept: they ARE part of the published module zip.
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/net v0.45.0 \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.24', '1.25']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        # Windows would otherwise default to pwsh, where `set -eux` fails.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+
+      - name: Test
+        run: |
+          set -euxo pipefail
+          go test -v ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/gotest.log"
+      - name: Test summary
+        if: always()
+        run: |
+          set -u
+          LOG="$RUNNER_TEMP/gotest.log"
+          awk '
+            /^[[:space:]]*--- PASS/ { pass++ }
+            /^[[:space:]]*--- FAIL/ { fail++ }
+            /^[[:space:]]*--- SKIP/ { skip++ }
+            /^ok[[:space:]]/        { pkgok++ }
+            /^FAIL[[:space:]]/      { pkgfail++ }
+            END {
+              printf "Tests passed:  %d\n", pass
+              printf "Tests failed:  %d\n", fail
+              printf "Tests skipped: %d\n", skip
+              printf "Packages ok:   %d\n", pkgok
+              printf "Packages FAIL: %d\n", pkgfail
+            }' "$LOG"
